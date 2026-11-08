@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Your benchmark data and personal settings never leave your PC
+results.json
+results.json.tmp
+ocr_results.json
+ocr/
+runs/
+config.json

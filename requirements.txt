@@ -1,0 +1,9 @@
+# The logger (rtss_log.py) needs nothing beyond Python itself.
+# These are only for the overlay OCR (osd_ocr.py): the Windows built-in OCR engine.
+winrt-runtime
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections
+winrt-Windows.Globalization
+winrt-Windows.Graphics.Imaging
+winrt-Windows.Media.Ocr
+winrt-Windows.Storage.Streams

@@ -1,30 +1,33 @@
-"""Benchmark logger. Listens to your existing hotkeys, reads RTSS (frames) and Afterburner (sensors).
+# Copyright 2026 Relebogile Nkotswe (babygrandad). Licensed under the Apache License 2.0, see LICENSE and NOTICE.
+"""Light Benchmarking logger. Reads RTSS (every frame) and MSI Afterburner (sensors) while you play.
 
-Start it before a session and leave the window open:
+  python rtss_log.py setup      first time: pick your hotkeys, say whether you record video
+  python rtss_log.py check      what is installed, running and missing
+  python rtss_log.py            log runs (start it BEFORE the game)
+  python rtss_log.py label      give runs a game name and preset (when you don't record video)
+  python rtss_log.py relink     after renaming recordings: re-match runs and update presets
+  python rtss_log.py probe 10   show which games RTSS is sending frames for
 
-  python bench/rtss_log.py            log runs
-  python bench/rtss_log.py relink     after renaming clips: update presets and file names
-  python bench/rtss_log.py probe 10   show which apps RTSS is sending frames for
-
-Hotkeys (the logger only listens, Afterburner and NVIDIA keep working as before):
-  [         start a run. Pressed during a run: restart, the current attempt is thrown away
-  ]         stop and save. Runs under 5 s count as a reset and are not saved
-  Alt+F9   NVIDIA recording on/off. Runs are linked to the clip a few seconds later
+Your hotkeys (set in setup; the logger only listens, your other tools keep working):
+  start key        start a run. Pressed during a run: restart, the current attempt is thrown away
+  stop key         stop and save
+  record key       optional: your video recorder's hotkey, used to link runs to recordings
 
 Beeps: one = started, two = saved, three quick = not saved.
 
-Recorded per run, as one entry in results.json (frames and sensor readings are only kept in
-memory during the run and thrown away once the numbers are worked out):
-  game, preset, clip, where the run sits in the clip, resolution, API, RAM setup,
-  avg FPS, 1% low (RTSS integral method), avg frametime, GPU / CPU usage and temps, RAM,
-  share of the run that was GPU / CPU bound
+Each saved run is one entry in results.json (frames and sensor readings are only kept in memory
+during the run and thrown away once the numbers are worked out): game, preset, recording (if any),
+resolution, API, RAM setup, avg FPS, 1% low (RTSS integral method), avg frametime, GPU / CPU usage
+and temps, RAM, share of the run that was GPU / CPU bound.
 
-Not saved (three quick beeps): runs under 5 s, runs where the game closed, and runs where more
-than 10% of the time has no frames. A freeze or hitch is not a gap: it is one long frame and counts.
+Not saved (three quick beeps): runs under the minimum length (5 s), runs where the game closed,
+and runs where more than 10% of the time has no frames. A freeze or hitch is not a gap: it is one
+long frame and counts.
 
-Game comes from the NVIDIA folder, preset from the clip name: everything after the first " - "
-("Onimusha - High, DLSS Quality, No RT" -> "High, DLSS Quality, No RT"). One run per clip: a newer
-run in the same clip replaces the older one. Read only: nothing is injected or sent anywhere.
+With video on, each run is linked to the recording that was running at the same time. Game comes
+from the recording's folder, preset from its name: everything after the first " - "
+("Onimusha - High, DLSS Quality" -> "High, DLSS Quality"). One run per recording: a newer run in the
+same recording replaces the older one. Read only: nothing is injected or sent anywhere.
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -39,13 +42,11 @@ import time
 import winsound
 from datetime import datetime
 
+from bench_setup import Hotkey, check, combo_name, require_config, setup
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, 'results.json')
-VIDEO_ROOT = r'D:\Nvidia Recordings SSD\Game vids'
-MIN_RUN_S = 5
-MIN_COVERAGE = 0.9  # logged frame time must cover 90% of the clock time between [ and ]
 GPU_BOUND, CPU_GPU_IDLE, CPU_THREAD_BUSY = 95, 90, 90  # % thresholds for the bottleneck label
-VK_LBRACKET, VK_RBRACKET, VK_MENU, VK_F9 = 0xDB, 0xDD, 0x12, 0x78
 
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -66,8 +67,6 @@ k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
 k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
 user32.GetForegroundWindow.restype = wt.HWND
 user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
-user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
-user32.GetAsyncKeyState.restype = ctypes.c_short
 
 PIPE_NAME = r'\\.\PIPE\RTSS_Frametime'
 ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED = 109, 535
@@ -75,8 +74,8 @@ INVALID_HANDLE = ctypes.c_void_p(-1).value
 FRAME = 8  # FRAMETIME_PIPE_DATA { DWORD dwApp; DWORD dwFrametime; }  (RTSS SDK, Samples/Pipe)
 API = {1: 'OpenGL', 2: 'DirectDraw', 3: 'D3D8', 4: 'D3D9', 5: 'D3D9Ex', 6: 'D3D10', 7: 'D3D11',
        8: 'D3D12', 9: 'D3D12 AFR', 10: 'Vulkan'}
-# Offsets inside RTSS_SHARED_MEMORY_APP_ENTRY (RTSSSharedMemory.h, v2.21, x64 packing; the
-# struct adds up to dwAppEntrySize = 12416 on this PC, which confirms the layout)
+# Offsets inside RTSS_SHARED_MEMORY_APP_ENTRY (RTSSSharedMemory.h, v2.21, x64 packing; the struct
+# adds up to dwAppEntrySize = 12416 for RTSS 7.3.x, which confirms the layout)
 APP_PID, APP_NAME, APP_FLAGS, APP_RES_X, APP_RES_Y = 0, 4, 264, 9224, 9228
 # Afterburner sensors (MAHMSharedMemory entry: 5 x char[260] names, then float data)
 SENSORS = {'gpu_usage': 'GPU usage', 'gpu_temp': 'GPU temperature', 'cpu_usage': 'CPU usage',
@@ -106,7 +105,7 @@ def u32(addr):
 # ---------------------------------------------------------------- RTSS
 
 class FramePipe:
-    """Server end of the RTSS frametime pipe. RTSS connects to it by itself."""
+    """Server end of the RTSS frametime pipe. RTSS connects to it when a game starts."""
 
     def __init__(self):
         sd = ctypes.create_string_buffer(64)  # NULL DACL, as in the SDK sample, so RTSS can always connect
@@ -123,22 +122,22 @@ class FramePipe:
         self.h = k32.CreateNamedPipeW(PIPE_NAME, 0x3, 0x4 | 0x1, 255, size, size, 0, ctypes.byref(sa))
         if self.h in (None, INVALID_HANDLE):
             sys.exit(f'Could not create {PIPE_NAME} (error {ctypes.get_last_error()}). Is another logger open?')
-        self.connected = False
+        self.is_connected = False
         self.buf = ctypes.create_string_buffer(FRAME * 512)
 
     def read(self):
         """Every (app_slot, frametime_us) waiting in the pipe, without blocking."""
-        if not self.connected:
+        if not self.is_connected:
             if k32.ConnectNamedPipe(self.h, None) or ctypes.get_last_error() == ERROR_PIPE_CONNECTED:
-                self.connected = True
+                self.is_connected = True
             else:
                 return []
         out, n = [], wt.DWORD()
         while k32.ReadFile(self.h, self.buf, len(self.buf), ctypes.byref(n), None) and n.value:
             out.extend(struct.iter_unpack('<II', self.buf.raw[:n.value - n.value % FRAME]))
-        if ctypes.get_last_error() == ERROR_BROKEN_PIPE:  # RTSS restarted
+        if ctypes.get_last_error() == ERROR_BROKEN_PIPE:  # the game closed or RTSS restarted
             k32.DisconnectNamedPipe(self.h)
-            self.connected = False
+            self.is_connected = False
         return out
 
 
@@ -243,7 +242,7 @@ def ram_setup():
 # ---------------------------------------------------------------- stats
 
 def summarize(ft_us, samples):
-    """FPS math as RTSS does it with this PC's settings (PercentileCalc=0, integral): the 1% low
+    """FPS math as RTSS does it with its default settings (PercentileCalc=0, integral): the 1% low
     is the frame where the slowest frames add up to 1% of the run's time."""
     n, total = len(ft_us), sum(ft_us)
     acc, low = 0, ft_us[0]
@@ -270,31 +269,38 @@ def summarize(ft_us, samples):
     return out
 
 
-# ---------------------------------------------------------------- files and clips
+# ---------------------------------------------------------------- recordings
 
 NV_STAMP = re.compile(r'(\d{4})\.(\d{2})\.(\d{2}) - (\d{2})\.(\d{2})\.(\d{2})\.(\d{2})$')
 
 
-def clips():
-    """[(path, start_unix, end_unix)] for every NVIDIA clip. Start is the timestamp in an untouched
-    NVIDIA name, else the file's creation time (Windows keeps it when you rename)."""
+def clips(cfg):
+    """[(path, start_unix, end_unix)] for every recording in the video folder. Start is the timestamp
+    in an untouched NVIDIA name, else the file's creation time (Windows keeps it when you rename)."""
+    video = cfg['video']
+    if not video['is_enabled'] or not video['folder']:
+        return []
     out = []
-    for path in glob.glob(os.path.join(VIDEO_ROOT, '**', '*.mp4'), recursive=True):
-        st = os.stat(path)
-        start = getattr(st, 'st_birthtime', st.st_ctime)
-        m = NV_STAMP.search(os.path.splitext(os.path.basename(path))[0])
-        if m:
-            y, mo, d, h, mi, s, cs = map(int, m.groups())
-            start = datetime(y, mo, d, h, mi, s).timestamp() + cs / 100
-        out.append((path, start, st.st_mtime))
+    for ext in video['extensions']:
+        for path in glob.glob(os.path.join(video['folder'], '**', f'*{ext}'), recursive=True):
+            st = os.stat(path)
+            start = getattr(st, 'st_birthtime', st.st_ctime)
+            m = NV_STAMP.search(os.path.splitext(os.path.basename(path))[0])
+            if m:
+                y, mo, d, h, mi, s, cs = map(int, m.groups())
+                start = datetime(y, mo, d, h, mi, s).timestamp() + cs / 100
+            out.append((path, start, st.st_mtime))
     return out
 
 
-def describe(clip_path):
-    """Game from the NVIDIA folder, preset from everything after the first " - " in a renamed clip."""
-    game = re.sub(r'\s+', ' ', os.path.basename(os.path.dirname(clip_path))).strip()
+def describe(clip_path, video_folder):
+    """(game, preset) from a recording. Game from its folder when the recorder sorts recordings into
+    one folder per game (NVIDIA does), preset from everything after the first " - " in its name."""
+    parent = os.path.dirname(clip_path)
+    is_in_game_folder = os.path.normcase(os.path.abspath(parent)) != os.path.normcase(os.path.abspath(video_folder))
+    game = re.sub(r'\s+', ' ', os.path.basename(parent)).strip() if is_in_game_folder else None
     stem = os.path.splitext(os.path.basename(clip_path))[0]
-    preset = '' if NV_STAMP.search(stem) or ' - ' not in stem else stem.split(' - ', 1)[1].strip()
+    preset = None if NV_STAMP.search(stem) or ' - ' not in stem else stem.split(' - ', 1)[1].strip()
     return game, preset
 
 
@@ -312,10 +318,10 @@ def store(data):
     os.replace(tmp, RESULTS)
 
 
-def relink(data, quiet=False):
-    """Match each run to the clip recording during it and keep the newest run per clip.
-    Safe to run any time, also after renaming clips."""
-    all_clips = clips()
+def relink(data, cfg, quiet=False):
+    """Match each run to the recording made during it and keep the newest run per recording.
+    Safe to run any time, also after renaming recordings. Does nothing with video off."""
+    all_clips = clips(cfg)
     for run in data['runs']:
         best, best_overlap = None, 0.0
         for c in all_clips:
@@ -324,10 +330,14 @@ def relink(data, quiet=False):
                 best, best_overlap = c, overlap
         if best:
             path, c0, c1 = best
-            game, preset = describe(path)
-            run.update(clip=os.path.basename(path), clip_path=path, game=game, preset=preset,
+            game, preset = describe(path, cfg['video']['folder'])
+            run.update(clip=os.path.basename(path), clip_path=path,
                        clip_from_s=round(run['started_unix'] - c0, 1), clip_to_s=round(run['ended_unix'] - c0, 1),
-                       fully_on_clip=c0 <= run['started_unix'] and run['ended_unix'] <= c1 + 2)
+                       is_fully_on_clip=c0 <= run['started_unix'] and run['ended_unix'] <= c1 + 2)
+            if game:
+                run['game'] = game
+            if preset:
+                run['preset'] = preset
 
     newest = {}
     for run in data['runs']:
@@ -347,25 +357,47 @@ def relink(data, quiet=False):
     return data
 
 
+def label():
+    """Type a game name and preset for saved runs (for runs without a recording to name them)."""
+    data = load()
+    if not data['runs']:
+        print('No saved runs yet.')
+        return
+    for i, r in enumerate(data['runs'], 1):
+        print(f"{i:3}. {r['started']}  {r['game']:30.30s} {r.get('preset') or '(no preset)':30.30s} "
+              f"{r['avg_fps']} avg / {r['p1_low_fps']} 1% low")
+    print('\nPick a run number (Enter to finish). Press Enter at a prompt to keep the current value.')
+    while True:
+        pick = input('\nRun #: ').strip()
+        if not pick:
+            break
+        if not pick.isdigit() or not 1 <= int(pick) <= len(data['runs']):
+            print('  No run with that number')
+            continue
+        run = data['runs'][int(pick) - 1]
+        run['game'] = input(f"  Game [{run['game']}]: ").strip() or run['game']
+        run['preset'] = input(f"  Preset [{run.get('preset') or ''}]: ").strip() or run.get('preset', '')
+        store(data)
+        print(f"  saved: {run['game']} | {run['preset']}")
+
+
 # ---------------------------------------------------------------- main loop
 
 def probe(pipe, seconds):
-    print(f'Listening for {seconds:g}s. Have a game (or any 3D app RTSS hooks) on screen...')
+    print(f'Listening for {seconds:g}s. Start or restart a game now: RTSS connects when a game launches.')
     counts, t0 = {}, time.time()
     while time.time() - t0 < seconds:
         for slot, _ in pipe.read():
             counts[slot] = counts.get(slot, 0) + 1
         time.sleep(0.01)
-    if not pipe.connected:
-        print('No frames: RTSS sends them from inside a running game, so start one (with RTSS running) and probe again.')
-    elif not counts:
-        print('RTSS connected, but no frames arrived. Is a hooked 3D app on screen?')
+    if not pipe.is_connected and not counts:
+        print('No frames. RTSS only connects at game launch: keep this running, then start the game.')
     for slot, n in sorted(counts.items(), key=lambda kv: -kv[1]):
         a = app_info(slot)
-        print(f"  {a['exe']} (pid {a['pid']}, {a['api']}, {a['res'] or '?'}): {n} frames, ~{n / seconds:.0f} fps")
+        print(f"  {a['exe']} (pid {a['pid']}, {a['api']}, {a['res'] or '?'}): {n} frames")
     s = read_sensors()
     print('Afterburner sensors:', ', '.join(f'{k}={v}' for k, v in s.items()) if s['gpu_usage'] is not None
-          else 'not available (is Afterburner running?)')
+          else 'not available (is MSI Afterburner running?)')
     print('RAM:', ram_setup() or 'unknown')
 
 
@@ -374,13 +406,13 @@ def beep_not_saved():
         winsound.Beep(660, 70)
 
 
-def save(run, now, ram):
+def save(run, now, ram, cfg):
     logged, clock = sum(run['ft']) / 1e6, now - run['start']
-    if logged < MIN_RUN_S:
-        print(f'\n[RESET] {logged:.1f}s, not saved (under {MIN_RUN_S}s)')
+    if logged < cfg['min_run_s']:
+        print(f"\n[RESET] {logged:.1f}s, not saved (under {cfg['min_run_s']}s)")
         beep_not_saved()
         return
-    if logged < MIN_COVERAGE * clock:
+    if logged < cfg['min_coverage'] * clock:
         print(f'\n[DISCARDED] only {logged:.0f}s of {clock:.0f}s had frames, not saved')
         beep_not_saved()
         return
@@ -395,9 +427,13 @@ def save(run, now, ram):
     }
     data = load()
     data['runs'].append(entry)
-    r = next(x for x in relink(data)['runs'] if x['started_unix'] == run['start'])
-    where = (f"{r['clip']} @ {r['clip_from_s']:.0f}s-{r['clip_to_s']:.0f}s" if r.get('clip')
-             else 'no clip yet (links after Alt+F9)')
+    r = next(x for x in relink(data, cfg)['runs'] if x['started_unix'] == run['start'])
+    if not cfg['video']['is_enabled']:
+        where = 'name it later: python rtss_log.py label'
+    elif r.get('clip'):
+        where = f"{r['clip']} @ {r['clip_from_s']:.0f}s-{r['clip_to_s']:.0f}s"
+    else:
+        where = 'no recording found yet (python rtss_log.py relink)'
     bound = (f"GPU bound {r['gpu_bound_pct']}% / CPU bound {r['cpu_bound_pct']}%"
              if r['gpu_bound_pct'] is not None else 'no sensors')
     print(f"\n[SAVED] {r['avg_fps']} avg | {r['p1_low_fps']} 1% low | {bound} | {r['duration_s']:.0f}s | {where}")
@@ -405,47 +441,42 @@ def save(run, now, ram):
     winsound.Beep(1320, 90)
 
 
-def main():
+def main(cfg):
     pipe = FramePipe()
-    if sys.argv[1:2] == ['probe']:
-        return probe(pipe, float(sys.argv[2]) if len(sys.argv) > 2 else 10)
-
+    start_key, stop_key = Hotkey(cfg['start_key']), Hotkey(cfg['stop_key'])
+    record_key = Hotkey(cfg['video']['record_key'] if cfg['video']['is_enabled'] else None)
     ram = ram_setup()
     print(f'RAM: {ram or "unknown"}')
-    print('Logger ready.   [ start/restart    ] save    Alt+F9 recording    Ctrl+C quits')
-    keys = dict.fromkeys((VK_LBRACKET, VK_RBRACKET, VK_F9), False)
-    run, relink_at, waiting_msg = None, 0, 0
+    print(f"Logger ready.  {combo_name(cfg['start_key'])} start/restart   {combo_name(cfg['stop_key'])} save"
+          f"   Ctrl+C quits")
+    print('Start your game now (after this window): RTSS connects to the logger when a game launches.')
+    run, relink_at, waiting_msg = None, 0, time.time()
     while True:
         frames = pipe.read()
         now = time.time()
-        pressed = set()
-        for vk in keys:
-            down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
-            if down and not keys[vk]:
-                pressed.add(vk)
-            keys[vk] = down
+        is_start, is_stop, is_record = start_key.pressed(), stop_key.pressed(), record_key.pressed()
 
-        if VK_F9 in pressed and user32.GetAsyncKeyState(VK_MENU) & 0x8000:
-            relink_at = now + 4  # give NVIDIA a moment to create or finish the file
+        if is_record:
+            relink_at = now + 4  # give the recorder a moment to create or finish the file
         if relink_at and now >= relink_at and run is None:
             relink_at = 0
-            relink(load())
+            relink(load(), cfg)
 
-        if VK_LBRACKET in pressed:
+        if is_start:
             print('\n[REC] restarted' if run else f'\n[REC] started {datetime.now():%H:%M:%S}')
             run = {'pid': foreground_pid(), 'slot': None, 'ft': [], 'samples': [], 'start': now, 'tick': now}
             winsound.Beep(880, 120)
             continue
 
         if run is None:
-            if not pipe.connected and now - waiting_msg > 10:
+            if not pipe.is_connected and now - waiting_msg > 30:
                 waiting_msg = now
-                print('waiting for RTSS to connect...')
+                print('waiting for a game (RTSS connects when a game launches)...')
             time.sleep(0.005)
             continue
 
         for slot, us in frames:
-            if run['slot'] is None:  # lock onto the game that was in front when [ was pressed
+            if run['slot'] is None:  # lock onto the game that was in front when the start key was pressed
                 if app_info(slot)['pid'] != run['pid']:
                     continue
                 run['slot'] = slot
@@ -463,22 +494,34 @@ def main():
                 recent = run['ft'][-120:]
                 print(f"\r  {now - run['start']:5.0f}s  {len(run['ft']):7d} frames  "
                       f"~{1e6 * len(recent) / sum(recent):5.1f} fps", end='', flush=True)
-        if VK_RBRACKET in pressed:
+        if is_stop:
             if run['slot'] is None:
-                print('\n[RESET] no frames from the game in front. Is it hooked by RTSS? (try: probe 10)')
+                print('\n[RESET] no frames from the game in front. Was the logger started before the game? '
+                      '(try: python rtss_log.py probe 30)')
                 beep_not_saved()
             else:
-                save(run, now, ram)
+                save(run, now, ram, cfg)
             run = None
         time.sleep(0.005)
 
 
 if __name__ == '__main__':
+    command = sys.argv[1] if len(sys.argv) > 1 else None
     try:
-        if sys.argv[1:2] == ['relink']:
-            for r in relink(load())['runs']:
-                print(f"{r.get('clip') or '(no clip)':55s} {r['avg_fps']:6} avg {r['p1_low_fps']:6} 1% low")
+        if command == 'setup':
+            setup()
+        elif command == 'check':
+            check()
+        elif command == 'label':
+            label()
+        elif command == 'relink':
+            for r in relink(load(), require_config())['runs']:
+                print(f"{r.get('clip') or '(no recording)':55s} {r['avg_fps']:6} avg {r['p1_low_fps']:6} 1% low")
+        elif command == 'probe':
+            probe(FramePipe(), float(sys.argv[2]) if len(sys.argv) > 2 else 10)
+        elif command is None:
+            main(require_config())
         else:
-            main()
+            sys.exit(__doc__)
     except KeyboardInterrupt:
         print('\nbye')
